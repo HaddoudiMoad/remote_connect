@@ -1,11 +1,10 @@
-﻿# client_full_control_scroll.py
+﻿# client_full_control_fast.py
 import socket
 import struct
 import sys
-from typing import Optional, Tuple
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QResizeEvent, QKeyEvent, QMouseEvent, QWheelEvent
+from PyQt6.QtGui import QImage, QPixmap, QResizeEvent, QKeyEvent, QMouseEvent
 from PyQt6.QtWidgets import QApplication, QMainWindow, QLabel, QMessageBox
 
 SERVER_IP = "10.50.156.216"  # 🔴 change to server IP
@@ -16,7 +15,7 @@ class ReceiverThread(QThread):
     frame_received = pyqtSignal(QImage)
     error = pyqtSignal(str)
 
-    def __init__(self, sock: socket.socket):
+    def __init__(self, sock):
         super().__init__()
         self.sock = sock
         self._running = True
@@ -24,7 +23,7 @@ class ReceiverThread(QThread):
     def stop(self):
         self._running = False
 
-    def recv_exact(self, n: int) -> Optional[bytes]:
+    def recv_exact(self, n):
         data = b""
         while len(data) < n and self._running:
             chunk = self.sock.recv(n - len(data))
@@ -54,7 +53,7 @@ class ReceiverThread(QThread):
 
 
 class RemoteScreenLabel(QLabel):
-    def __init__(self, controller: "RemoteClient"):
+    def __init__(self, controller):
         super().__init__()
         self.controller = controller
         self.setMouseTracking(True)
@@ -67,23 +66,21 @@ class RemoteScreenLabel(QLabel):
     def mousePressEvent(self, event: QMouseEvent):
         self.controller.handle_mouse_event(event, move_only=False)
 
-    def wheelEvent(self, event: QWheelEvent):
-        self.controller.handle_wheel_event(event)
-
 
 class RemoteClient(QMainWindow):
-    def __init__(self, sock: socket.socket):
+    def __init__(self, sock):
         super().__init__()
         self.sock = sock
         self.receiver = ReceiverThread(sock)
         self.receiver.frame_received.connect(self.on_frame)
         self.receiver.error.connect(self.on_error)
 
-        self.remote_width: Optional[int] = None
-        self.remote_height: Optional[int] = None
-        self.last_frame: Optional[QImage] = None
+        self.remote_width = None
+        self.remote_height = None
+        self.last_frame = None  # QImage
 
-        self.last_mouse_remote: Optional[Tuple[int, int]] = None
+        # for throttling mouse moves
+        self.last_mouse_remote = None  # (x, y)
 
         self.screen_label = RemoteScreenLabel(self)
         self.setCentralWidget(self.screen_label)
@@ -97,28 +94,21 @@ class RemoteClient(QMainWindow):
 
         self.receiver.start()
 
-    # ---------- send helpers ----------
+    # --------- send helpers ----------
 
-    def send_mouse_move(self, x: int, y: int):
+    def send_mouse_move(self, x, y):
         try:
             msg = struct.pack("!cii", b'M', int(x), int(y))
             self.sock.sendall(msg)
         except Exception as e:
             print(f"[CLIENT] send_mouse_move error: {e}")
 
-    def send_mouse_click(self, button: int = 1):
+    def send_mouse_click(self, button=1):
         try:
             msg = struct.pack("!cB", b'C', button)
             self.sock.sendall(msg)
         except Exception as e:
             print(f"[CLIENT] send_mouse_click error: {e}")
-
-    def send_wheel(self, vert_steps: int, horiz_steps: int = 0):
-        try:
-            msg = struct.pack("!cii", b'W', int(vert_steps), int(horiz_steps))
-            self.sock.sendall(msg)
-        except Exception as e:
-            print(f"[CLIENT] send_wheel error: {e}")
 
     def send_key_name(self, name: str):
         try:
@@ -132,7 +122,7 @@ class RemoteClient(QMainWindow):
         except Exception as e:
             print(f"[CLIENT] send_key_name error: {e}")
 
-    # ---------- frame handling ----------
+    # --------- frame handling --------
 
     def on_frame(self, img: QImage):
         self.last_frame = img
@@ -161,19 +151,20 @@ class RemoteClient(QMainWindow):
     def on_error(self, msg: str):
         QMessageBox.warning(self, "Connection error", msg)
 
-    # ---------- mouse mapping ----------
+    # --------- mouse mapping ---------
 
-    def _map_label_to_remote(self, x: float, y: float) -> Optional[Tuple[int, int]]:
+    def handle_mouse_event(self, event: QMouseEvent, move_only: bool):
         if self.remote_width is None or self.remote_height is None:
-            return None
+            return
         if self.last_frame is None:
-            return None
+            return
 
         label_w = self.screen_label.width()
         label_h = self.screen_label.height()
         if label_w <= 0 or label_h <= 0:
-            return None
+            return
 
+        # aspect-ratio aware mapping: active image area inside label
         remote_w = self.remote_width
         remote_h = self.remote_height
         scale = min(label_w / remote_w, label_h / remote_h)
@@ -182,24 +173,20 @@ class RemoteClient(QMainWindow):
         offset_x = (label_w - img_w) / 2
         offset_y = (label_h - img_h) / 2
 
-        # Ignore black borders
+        x = event.position().x()
+        y = event.position().y()
+
+        # ignore clicks on black borders
         if x < offset_x or x > offset_x + img_w or y < offset_y or y > offset_y + img_h:
-            return None
+            return
 
         local_x = x - offset_x
         local_y = y - offset_y
 
         remote_x = int(local_x / scale)
         remote_y = int(local_y / scale)
-        return remote_x, remote_y
 
-    def handle_mouse_event(self, event: QMouseEvent, move_only: bool):
-        pos = self._map_label_to_remote(event.position().x(), event.position().y())
-        if pos is None:
-            return
-        remote_x, remote_y = pos
-
-        # throttle small movements
+        # throttle positional spam when just moving
         if self.last_mouse_remote is not None and move_only:
             lx, ly = self.last_mouse_remote
             if abs(remote_x - lx) < 2 and abs(remote_y - ly) < 2:
@@ -216,19 +203,11 @@ class RemoteClient(QMainWindow):
             elif event.button() == Qt.MouseButton.MiddleButton:
                 self.send_mouse_click(3)
 
-    def handle_wheel_event(self, event: QWheelEvent):
-        # Each step is usually 120 units
-        delta = event.angleDelta()
-        steps_vert = delta.y() // 120
-        steps_horiz = delta.x() // 120
-        if steps_vert != 0 or steps_horiz != 0:
-            self.send_wheel(steps_vert, steps_horiz)
-
-    # ---------- keyboard & shortcuts ----------
+    # --------- keyboard & shortcuts ---------
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.isAutoRepeat():
-            # Optional: allow or ignore repeats
+            # optional: ignore repeats
             pass
 
         combo_name = self.build_key_name(event)
@@ -236,11 +215,11 @@ class RemoteClient(QMainWindow):
             print("[CLIENT] key ->", combo_name)
             self.send_key_name(combo_name)
 
-        # local quit
         if combo_name == 'q':
-            self.close()
+            pass
+            #self.close()
 
-    def build_key_name(self, event: QKeyEvent) -> Optional[str]:
+    def build_key_name(self, event: QKeyEvent) -> str | None:
         mods = []
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             mods.append("ctrl")
@@ -258,10 +237,13 @@ class RemoteClient(QMainWindow):
                 base = 'space'
         else:
             key = event.key()
+
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 base = "enter"
             elif key == Qt.Key.Key_Escape:
                 base = "esc"
+            elif 0 <= key <= 1114111:
+                base = chr(key)
             elif key == Qt.Key.Key_Tab:
                 base = "tab"
             elif key == Qt.Key.Key_Backspace:
