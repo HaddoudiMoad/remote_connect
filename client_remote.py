@@ -1,5 +1,4 @@
-﻿# client_full_control_fast.py
-import socket
+﻿import socket
 import struct
 import sys
 
@@ -7,7 +6,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QResizeEvent, QKeyEvent, QMouseEvent
 from PyQt6.QtWidgets import QApplication, QMainWindow, QLabel, QMessageBox
 
-SERVER_IP = "10.50.156.216"  # 🔴 change to server IP
+SERVER_IP = "10.50.163.66"
 PORT = 5000
 
 
