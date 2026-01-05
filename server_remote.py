@@ -3,20 +3,22 @@ import socket
 import struct
 import io
 import threading
+import time
+
 from mss import mss
 from PIL import Image
 import pyautogui
-import time
 
 HOST = "0.0.0.0"
 PORT = 5000
 
-# Fast interaction
-pyautogui.FAILSAFE = False
-pyautogui.PAUSE = 0
+# Faster interaction
+pyautogui.FAILSAFE = False  # disable top-left failsafe
+pyautogui.PAUSE = 0         # no delay between calls
 
 
-def recv_exact(conn, n, stop_event: threading.Event):
+def recv_exact(conn: socket.socket, n: int, stop_event: threading.Event):
+    """Receive exactly n bytes or return None if connection is closed / stop requested."""
     data = b""
     while len(data) < n and not stop_event.is_set():
         try:
@@ -29,16 +31,19 @@ def recv_exact(conn, n, stop_event: threading.Event):
     return data
 
 
-def send_frames(conn, stop_event: threading.Event, fps_limit=30):
-    """Continuously capture and send frames until stop_event is set or socket fails."""
+def send_frames(conn: socket.socket, stop_event: threading.Event, fps_limit: int = 30):
+    """
+    Capture screen and send frames:
+    [uint32 size][JPEG bytes...]
+    """
     sct = mss()
-    min_frame_time = 1.0 / fps_limit if fps_limit else 0.0
+    min_frame_time = 1.0 / fps_limit if fps_limit and fps_limit > 0 else 0.0
 
     try:
         while not stop_event.is_set():
-            start = time.time()
+            t0 = time.time()
 
-            screenshot = sct.grab(sct.monitors[1])
+            screenshot = sct.grab(sct.monitors[1])  # monitor 1 (primary)
             img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
 
             buf = io.BytesIO()
@@ -50,8 +55,8 @@ def send_frames(conn, stop_event: threading.Event, fps_limit=30):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 break
 
-            # FPS throttle (reduces CPU/network load)
-            elapsed = time.time() - start
+            # FPS throttle
+            elapsed = time.time() - t0
             remaining = min_frame_time - elapsed
             if remaining > 0:
                 time.sleep(remaining)
@@ -62,13 +67,25 @@ def send_frames(conn, stop_event: threading.Event, fps_limit=30):
         stop_event.set()
 
 
-def handle_input(conn, stop_event: threading.Event):
+def _btn_code_to_name(code: int) -> str:
+    if code == 1:
+        return "left"
+    if code == 2:
+        return "right"
+    if code == 3:
+        return "middle"
+    return "left"
+
+
+def handle_input(conn: socket.socket, stop_event: threading.Event):
     """
-    Protocol:
-    - 'M' + int32 x + int32 y -> move mouse
-    - 'C' + uint8 button -> click (1=left, 2=right, 3=middle)
+    Input Protocol:
+    - 'M' + int32 x + int32 y           -> move mouse
+    - 'C' + uint8 button               -> click (1=left,2=right,3=middle)
+    - 'P' + uint8 button               -> mouse down (drag start)
+    - 'R' + uint8 button               -> mouse up   (drag end)
     - 'W' + int32 vertical + int32 horizontal -> wheel scroll
-    - 'K' + uint8 len + bytes(name) -> key/hotkey ("a", "enter", "ctrl+z")
+    - 'K' + uint8 len + bytes(name)    -> key/hotkey ("a","enter","ctrl+z")
     """
     try:
         while not stop_event.is_set():
@@ -89,19 +106,29 @@ def handle_input(conn, stop_event: threading.Event):
                 btn_bytes = recv_exact(conn, 1, stop_event)
                 if not btn_bytes:
                     break
-                button_code = btn_bytes[0]
-                if button_code == 1:
-                    pyautogui.click(button='left')
-                elif button_code == 2:
-                    pyautogui.click(button='right')
-                elif button_code == 3:
-                    pyautogui.click(button='middle')
+                btn = _btn_code_to_name(btn_bytes[0])
+                pyautogui.click(button=btn)
+
+            elif etype == ord('P'):  # mouse down
+                btn_bytes = recv_exact(conn, 1, stop_event)
+                if not btn_bytes:
+                    break
+                btn = _btn_code_to_name(btn_bytes[0])
+                pyautogui.mouseDown(button=btn)
+
+            elif etype == ord('R'):  # mouse up
+                btn_bytes = recv_exact(conn, 1, stop_event)
+                if not btn_bytes:
+                    break
+                btn = _btn_code_to_name(btn_bytes[0])
+                pyautogui.mouseUp(button=btn)
 
             elif etype == ord('W'):
                 data = recv_exact(conn, 8, stop_event)
                 if not data:
                     break
                 vert, horiz = struct.unpack("!ii", data)
+
                 if vert != 0:
                     pyautogui.scroll(vert)
                 if horiz != 0:
@@ -115,6 +142,7 @@ def handle_input(conn, stop_event: threading.Event):
                 if not len_bytes:
                     break
                 (name_len,) = struct.unpack("!B", len_bytes)
+
                 key_bytes = recv_exact(conn, name_len, stop_event)
                 if not key_bytes:
                     break
@@ -139,20 +167,20 @@ def handle_input(conn, stop_event: threading.Event):
         stop_event.set()
 
 
-def handle_client(conn, addr):
+def handle_client(conn: socket.socket, addr):
     print(f"[SERVER] Connected by {addr}")
     stop_event = threading.Event()
 
-    t1 = threading.Thread(target=send_frames, args=(conn, stop_event), daemon=True)
+    t1 = threading.Thread(target=send_frames, args=(conn, stop_event, 30), daemon=True)
     t2 = threading.Thread(target=handle_input, args=(conn, stop_event), daemon=True)
     t1.start()
     t2.start()
 
-    # Wait until either thread ends, then stop the other
+    # Wait until either thread ends
     while not stop_event.is_set():
         time.sleep(0.05)
 
-    # Give threads a short chance to exit gracefully
+    # Gracefully finish
     t1.join(timeout=1)
     t2.join(timeout=1)
 
@@ -178,8 +206,7 @@ def main():
         while True:
             try:
                 conn, addr = server_sock.accept()
-                handle_client(conn, addr)
-                # After client disconnects, loop continues and server stays alive
+                handle_client(conn, addr)  # sequential: one client at a time
             except KeyboardInterrupt:
                 print("\n[SERVER] Shutting down (KeyboardInterrupt)")
                 break
@@ -189,3 +216,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
