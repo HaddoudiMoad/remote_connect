@@ -23,8 +23,6 @@ DEFAULT_PORT = 5000
 CONNECTIONS_FILE = os.path.join(os.path.expanduser("~"), ".remote_connections.json")
 
 
-# ----------------------------- Data model -----------------------------
-
 @dataclass
 class ConnectionItem:
     name: str
@@ -34,7 +32,6 @@ class ConnectionItem:
 
 def load_connections() -> list[ConnectionItem]:
     if not os.path.exists(CONNECTIONS_FILE):
-        # default entry
         return [ConnectionItem(name="Default", host="10.50.163.66", port=DEFAULT_PORT)]
     try:
         with open(CONNECTIONS_FILE, "r", encoding="utf-8") as f:
@@ -52,15 +49,15 @@ def load_connections() -> list[ConnectionItem]:
 
 
 def save_connections(items: list[ConnectionItem]) -> None:
-    data = [asdict(x) for x in items]
     with open(CONNECTIONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump([asdict(x) for x in items], f, indent=2)
 
 
-# ----------------------------- Receiver thread -----------------------------
+# ---------------- Receiver thread (Server->Client typed messages) ----------------
 
 class ReceiverThread(QThread):
     frame_received = pyqtSignal(QImage)
+    clipboard_received = pyqtSignal(str)
     error = pyqtSignal(str)
 
     def __init__(self, sock: socket.socket):
@@ -83,26 +80,40 @@ class ReceiverThread(QThread):
     def run(self):
         try:
             while self._running:
-                size_bytes = self.recv_exact(4)
-                if not size_bytes:
+                # [1 byte type][4 bytes length][payload]
+                t = self.recv_exact(1)
+                if not t:
+                    break
+                mtype = t  # bytes of length 1
+
+                lb = self.recv_exact(4)
+                if not lb:
+                    break
+                (n,) = struct.unpack("!I", lb)
+
+                payload = self.recv_exact(n)
+                if payload is None:
                     break
 
-                (size,) = struct.unpack("!I", size_bytes)
-                img_bytes = self.recv_exact(size)
-                if not img_bytes:
+                if mtype == b'F':
+                    img = QImage.fromData(payload, "JPEG")
+                    if not img.isNull():
+                        self.frame_received.emit(img)
+
+                elif mtype == b'B':
+                    text = payload.decode("utf-8", errors="replace")
+                    self.clipboard_received.emit(text)
+
+                else:
+                    # Unknown message type; stop to avoid desync
+                    self.error.emit(f"Unknown server message type: {mtype!r}")
                     break
-
-                img = QImage.fromData(img_bytes, "JPEG")
-                if img.isNull():
-                    continue
-
-                self.frame_received.emit(img)
 
         except Exception as e:
             self.error.emit(str(e))
 
 
-# ----------------------------- Screen label -----------------------------
+# ---------------- Screen label ----------------
 
 class RemoteScreenLabel(QLabel):
     def __init__(self, controller):
@@ -113,11 +124,10 @@ class RemoteScreenLabel(QLabel):
         self.setStyleSheet("background-color: black;")
 
     def mouseMoveEvent(self, event: QMouseEvent):
-        # If mouse button held, this is a drag movement
         dragging = bool(event.buttons() & (Qt.MouseButton.LeftButton |
                                           Qt.MouseButton.RightButton |
                                           Qt.MouseButton.MiddleButton))
-        self.controller.handle_mouse_event(event, move_only=True, dragging=dragging)
+        self.controller.handle_mouse_move(event, dragging=dragging)
 
     def mousePressEvent(self, event: QMouseEvent):
         self.controller.handle_mouse_press(event)
@@ -126,14 +136,11 @@ class RemoteScreenLabel(QLabel):
         self.controller.handle_mouse_release(event)
 
     def wheelEvent(self, event: QWheelEvent):
-        delta = event.angleDelta()
-        vert = int(delta.y())
-        horiz = int(delta.x())
-        if vert != 0 or horiz != 0:
-            self.controller.send_mouse_wheel(vert, horiz)
+        d = event.angleDelta()
+        self.controller.send_mouse_wheel(int(d.y()), int(d.x()))
 
 
-# ----------------------------- Connection dialog -----------------------------
+# ---------------- Connection dialog ----------------
 
 class ConnectionDialog(QDialog):
     def __init__(self, parent=None, item: ConnectionItem | None = None):
@@ -142,7 +149,6 @@ class ConnectionDialog(QDialog):
 
         self.name_edit = QLineEdit()
         self.host_edit = QLineEdit()
-
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(DEFAULT_PORT)
@@ -152,16 +158,16 @@ class ConnectionDialog(QDialog):
         form.addRow("Host/IP:", self.host_edit)
         form.addRow("Port:", self.port_spin)
 
-        btn_row = QHBoxLayout()
+        btns = QHBoxLayout()
         self.ok_btn = QPushButton("OK")
         self.cancel_btn = QPushButton("Cancel")
-        btn_row.addStretch(1)
-        btn_row.addWidget(self.ok_btn)
-        btn_row.addWidget(self.cancel_btn)
+        btns.addStretch(1)
+        btns.addWidget(self.ok_btn)
+        btns.addWidget(self.cancel_btn)
 
         layout = QVBoxLayout()
         layout.addLayout(form)
-        layout.addLayout(btn_row)
+        layout.addLayout(btns)
         self.setLayout(layout)
 
         self.ok_btn.clicked.connect(self.accept)
@@ -182,28 +188,27 @@ class ConnectionDialog(QDialog):
         return ConnectionItem(name=name, host=host, port=port)
 
 
-# ----------------------------- Main Window -----------------------------
+# ---------------- Main Window ----------------
 
 class RemoteClient(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        # Connection state
         self.sock: socket.socket | None = None
         self.receiver: ReceiverThread | None = None
         self.connected_to: ConnectionItem | None = None
 
-        # Frame state
         self.remote_width = None
         self.remote_height = None
-        self.last_frame = None  # QImage
+        self.last_frame = None
+        self.last_mouse_remote = None
 
-        # Input state
-        self.last_mouse_remote = None  # (x, y)
-        self._button_down = set()      # track which buttons are down {1,2,3}
+        # Clipboard sync loop protection
+        self._applying_remote_clipboard = False
+        self.clipboard = QApplication.clipboard()
+        self.clipboard.dataChanged.connect(self._on_local_clipboard_changed)
 
-        # UI
-        self.setWindowTitle("Python Remote Control (mini VNC) + Connections")
+        self.setWindowTitle("Python Remote Control (mini VNC) + Connections + Clipboard")
         self.resize(1300, 750)
 
         splitter = QSplitter()
@@ -220,23 +225,23 @@ class RemoteClient(QMainWindow):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.doubleClicked.connect(self.connect_selected)
 
-        btns = QHBoxLayout()
+        row1 = QHBoxLayout()
         self.btn_add = QPushButton("Add")
         self.btn_edit = QPushButton("Edit")
         self.btn_remove = QPushButton("Remove")
-        btns.addWidget(self.btn_add)
-        btns.addWidget(self.btn_edit)
-        btns.addWidget(self.btn_remove)
+        row1.addWidget(self.btn_add)
+        row1.addWidget(self.btn_edit)
+        row1.addWidget(self.btn_remove)
 
-        btns2 = QHBoxLayout()
+        row2 = QHBoxLayout()
         self.btn_connect = QPushButton("Connect")
         self.btn_disconnect = QPushButton("Disconnect")
-        btns2.addWidget(self.btn_connect)
-        btns2.addWidget(self.btn_disconnect)
+        row2.addWidget(self.btn_connect)
+        row2.addWidget(self.btn_disconnect)
 
         left_layout.addWidget(self.table, 1)
-        left_layout.addLayout(btns)
-        left_layout.addLayout(btns2)
+        left_layout.addLayout(row1)
+        left_layout.addLayout(row2)
 
         self.btn_add.clicked.connect(self.add_connection)
         self.btn_edit.clicked.connect(self.edit_connection)
@@ -244,7 +249,7 @@ class RemoteClient(QMainWindow):
         self.btn_connect.clicked.connect(self.connect_selected)
         self.btn_disconnect.clicked.connect(self.disconnect_current)
 
-        # Right: remote screen
+        # Right: screen
         self.screen_label = RemoteScreenLabel(self)
         self.screen_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -252,15 +257,14 @@ class RemoteClient(QMainWindow):
         splitter.addWidget(self.conn_widget)
         splitter.addWidget(self.screen_label)
         splitter.setSizes([350, 950])
-
         self.setCentralWidget(splitter)
+
         self.statusBar().showMessage("Disconnected")
 
-        # Load connections
-        self.connections: list[ConnectionItem] = load_connections()
+        self.connections = load_connections()
         self.refresh_table()
 
-    # -------------------- UI helpers --------------------
+    # ---------- Connections UI ----------
 
     def refresh_table(self):
         self.table.setRowCount(0)
@@ -272,13 +276,9 @@ class RemoteClient(QMainWindow):
             self.table.setItem(r, 2, QTableWidgetItem(str(item.port)))
         self.table.resizeColumnsToContents()
 
-    def selected_index(self) -> int | None:
+    def selected_index(self):
         sel = self.table.selectionModel().selectedRows()
-        if not sel:
-            return None
-        return sel[0].row()
-
-    # -------------------- Connections panel actions --------------------
+        return sel[0].row() if sel else None
 
     def add_connection(self):
         dlg = ConnectionDialog(self)
@@ -319,37 +319,33 @@ class RemoteClient(QMainWindow):
             return
         self.connect_to(self.connections[idx])
 
-    # -------------------- Connect / Disconnect --------------------
+    # ---------- Connect / Disconnect ----------
 
     def connect_to(self, item: ConnectionItem):
-        if self.sock is not None:
+        if self.sock:
             self.disconnect_current()
 
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect((item.host, item.port))
-            sock.settimeout(None)
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            s.connect((item.host, item.port))
+            s.settimeout(None)
         except Exception as e:
             QMessageBox.warning(self, "Connection failed", f"Could not connect to {item.host}:{item.port}\n{e}")
             return
 
-        self.sock = sock
+        self.sock = s
         self.connected_to = item
 
-        self.receiver = ReceiverThread(sock)
+        self.receiver = ReceiverThread(s)
         self.receiver.frame_received.connect(self.on_frame)
+        self.receiver.clipboard_received.connect(self.on_remote_clipboard)
         self.receiver.error.connect(self.on_error)
         self.receiver.start()
 
         self.statusBar().showMessage(f"Connected to {item.name} ({item.host}:{item.port})")
 
     def disconnect_current(self):
-        # release any stuck buttons remotely (best-effort)
-        for btn in list(self._button_down):
-            self.send_mouse_up(btn)
-        self._button_down.clear()
-
         if self.receiver:
             self.receiver.stop()
             try:
@@ -377,7 +373,7 @@ class RemoteClient(QMainWindow):
         self.screen_label.clear()
         self.statusBar().showMessage("Disconnected")
 
-    # -------------------- Sending helpers --------------------
+    # ---------- Send helpers (Client->Server events) ----------
 
     def _send(self, payload: bytes):
         if not self.sock:
@@ -387,24 +383,19 @@ class RemoteClient(QMainWindow):
         except Exception as e:
             print(f"[CLIENT] send error: {e}")
 
-    def send_mouse_move(self, x: int, y: int):
+    def send_mouse_move(self, x, y):
         self._send(struct.pack("!cii", b'M', int(x), int(y)))
 
-    def send_mouse_click(self, button: int = 1):
-        self._send(struct.pack("!cB", b'C', int(button)))
-
-    def send_mouse_down(self, button: int = 1):
+    def send_mouse_down(self, button):
         self._send(struct.pack("!cB", b'P', int(button)))
 
-    def send_mouse_up(self, button: int = 1):
+    def send_mouse_up(self, button):
         self._send(struct.pack("!cB", b'R', int(button)))
 
-    def send_mouse_wheel(self, vert: int, horiz: int):
+    def send_mouse_wheel(self, vert, horiz):
         self._send(struct.pack("!cii", b'W', int(vert), int(horiz)))
 
     def send_key_name(self, name: str):
-        if not self.sock:
-            return
         name_bytes = name.encode("ascii", errors="ignore")
         if not name_bytes:
             return
@@ -412,7 +403,11 @@ class RemoteClient(QMainWindow):
             name_bytes = name_bytes[:255]
         self._send(struct.pack("!cB", b'K', len(name_bytes)) + name_bytes)
 
-    # -------------------- Frame handling --------------------
+    def send_clipboard_text(self, text: str):
+        data = text.encode("utf-8", errors="replace")
+        self._send(struct.pack("!cI", b'B', len(data)) + data)
+
+    # ---------- Frame handling ----------
 
     def on_frame(self, img: QImage):
         self.last_frame = img
@@ -424,8 +419,6 @@ class RemoteClient(QMainWindow):
         if self.last_frame is None:
             return
         label_size = self.screen_label.size()
-        if label_size.width() <= 0 or label_size.height() <= 0:
-            return
         pix = QPixmap.fromImage(self.last_frame).scaled(
             label_size,
             Qt.AspectRatioMode.KeepAspectRatio,
@@ -441,13 +434,10 @@ class RemoteClient(QMainWindow):
         QMessageBox.warning(self, "Connection error", msg)
         self.disconnect_current()
 
-    # -------------------- Mouse mapping --------------------
+    # ---------- Mouse mapping ----------
 
     def _map_to_remote(self, event: QMouseEvent):
-        """Map local label coords to remote screen coords, returns (x,y) or None."""
-        if self.remote_width is None or self.remote_height is None:
-            return None
-        if self.last_frame is None:
+        if self.remote_width is None or self.remote_height is None or self.last_frame is None:
             return None
 
         label_w = self.screen_label.width()
@@ -455,100 +445,80 @@ class RemoteClient(QMainWindow):
         if label_w <= 0 or label_h <= 0:
             return None
 
-        remote_w = self.remote_width
-        remote_h = self.remote_height
-
-        scale = min(label_w / remote_w, label_h / remote_h)
-        img_w = remote_w * scale
-        img_h = remote_h * scale
-        offset_x = (label_w - img_w) / 2
-        offset_y = (label_h - img_h) / 2
+        rw, rh = self.remote_width, self.remote_height
+        scale = min(label_w / rw, label_h / rh)
+        img_w = rw * scale
+        img_h = rh * scale
+        off_x = (label_w - img_w) / 2
+        off_y = (label_h - img_h) / 2
 
         x = event.position().x()
         y = event.position().y()
-
-        # Ignore borders
-        if x < offset_x or x > offset_x + img_w or y < offset_y or y > offset_y + img_h:
+        if x < off_x or x > off_x + img_w or y < off_y or y > off_y + img_h:
             return None
 
-        local_x = x - offset_x
-        local_y = y - offset_y
-        remote_x = int(local_x / scale)
-        remote_y = int(local_y / scale)
-        return remote_x, remote_y
+        local_x = x - off_x
+        local_y = y - off_y
+        return int(local_x / scale), int(local_y / scale)
 
-    def handle_mouse_event(self, event: QMouseEvent, move_only: bool, dragging: bool = False):
+    def handle_mouse_move(self, event: QMouseEvent, dragging: bool = False):
         if not self.sock:
             return
-
         mapped = self._map_to_remote(event)
         if mapped is None:
             return
+        rx, ry = mapped
 
-        remote_x, remote_y = mapped
-
-        # Throttle: smoother during dragging
         threshold = 0 if dragging else 2
-        if self.last_mouse_remote is not None and move_only:
+        if self.last_mouse_remote is not None:
             lx, ly = self.last_mouse_remote
-            if abs(remote_x - lx) < threshold and abs(remote_y - ly) < threshold:
+            if abs(rx - lx) < threshold and abs(ry - ly) < threshold:
                 return
 
-        self.last_mouse_remote = (remote_x, remote_y)
-        self.send_mouse_move(remote_x, remote_y)
+        self.last_mouse_remote = (rx, ry)
+        self.send_mouse_move(rx, ry)
 
     def handle_mouse_press(self, event: QMouseEvent):
         if not self.sock:
             return
-
         mapped = self._map_to_remote(event)
         if mapped is None:
             return
-
-        # Move to correct position then press down
-        remote_x, remote_y = mapped
-        self.last_mouse_remote = (remote_x, remote_y)
-        self.send_mouse_move(remote_x, remote_y)
+        rx, ry = mapped
+        self.last_mouse_remote = (rx, ry)
+        self.send_mouse_move(rx, ry)
 
         if event.button() == Qt.MouseButton.LeftButton:
             self.send_mouse_down(1)
-            self._button_down.add(1)
         elif event.button() == Qt.MouseButton.RightButton:
             self.send_mouse_down(2)
-            self._button_down.add(2)
         elif event.button() == Qt.MouseButton.MiddleButton:
             self.send_mouse_down(3)
-            self._button_down.add(3)
 
     def handle_mouse_release(self, event: QMouseEvent):
         if not self.sock:
             return
-
-        # Ensure final position is applied
         mapped = self._map_to_remote(event)
         if mapped is not None:
-            remote_x, remote_y = mapped
-            self.last_mouse_remote = (remote_x, remote_y)
-            self.send_mouse_move(remote_x, remote_y)
+            rx, ry = mapped
+            self.last_mouse_remote = (rx, ry)
+            self.send_mouse_move(rx, ry)
 
         if event.button() == Qt.MouseButton.LeftButton:
             self.send_mouse_up(1)
-            self._button_down.discard(1)
         elif event.button() == Qt.MouseButton.RightButton:
             self.send_mouse_up(2)
-            self._button_down.discard(2)
         elif event.button() == Qt.MouseButton.MiddleButton:
             self.send_mouse_up(3)
-            self._button_down.discard(3)
 
-    # -------------------- Keyboard --------------------
+    # ---------- Keyboard ----------
 
     def keyPressEvent(self, event: QKeyEvent):
-        combo_name = self.build_key_name(event)
-        if combo_name:
-            self.send_key_name(combo_name)
+        name = self.build_key_name(event)
+        if name:
+            self.send_key_name(name)
 
-    def build_key_name(self, event: QKeyEvent) -> str | None:
+    def build_key_name(self, event: QKeyEvent):
         mods = []
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             mods.append("ctrl")
@@ -594,12 +564,40 @@ class RemoteClient(QMainWindow):
             elif key == Qt.Key.Key_PageDown:
                 base = "pagedown"
             elif Qt.Key.Key_F1 <= key <= Qt.Key.Key_F12:
-                idx = key - Qt.Key.Key_F1 + 1
-                base = f"f{idx}"
+                base = f"f{key - Qt.Key.Key_F1 + 1}"
+
         if not base:
             return None
-
         return "+".join(mods + [base]) if mods else base
+
+    # ---------- Clipboard sync ----------
+
+    def _on_local_clipboard_changed(self):
+        """
+        When local clipboard changes, push to server.
+        Avoid echo loop when we are applying remote clipboard.
+        """
+        if self._applying_remote_clipboard:
+            return
+        if not self.sock:
+            return
+
+        text = self.clipboard.text()
+        if text is None:
+            text = ""
+        self.send_clipboard_text(text)
+
+    def on_remote_clipboard(self, text: str):
+        """
+        When server clipboard arrives, set local clipboard (avoid loop).
+        """
+        try:
+            self._applying_remote_clipboard = True
+            # only set if different to reduce noise
+            if self.clipboard.text() != text:
+                self.clipboard.setText(text)
+        finally:
+            self._applying_remote_clipboard = False
 
     def closeEvent(self, event):
         self.disconnect_current()
