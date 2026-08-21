@@ -5,9 +5,9 @@ Mini Python remote-control (screen + input + clipboard) with a PyQt6 client and 
 
 Project structure
 -----------------
-- server_remote.py  — TCP server: captures the primary monitor, streams JPEG frames, handles input and clipboard updates.
-- client_remote.py  — PyQt6 GUI client: connects to server, displays remote screen, forwards mouse/keyboard, syncs clipboard, and manages saved connections.
-- server_remote.spec — PyInstaller spec file (for building a standalone server binary).
+- server_remote.py  - TCP server: captures the primary monitor, streams JPEG frames, handles input and clipboard updates.
+- client_remote.py  - PyQt6 GUI client: connects to server, displays remote screen, forwards mouse/keyboard, syncs clipboard, and manages saved connections.
+- server_remote.spec - PyInstaller spec file (for building a standalone server binary).
 
 Features
 --------
@@ -72,17 +72,17 @@ Protocol (brief)
 Messages are sent over a TCP connection with simple typed frames:
 
 Server -> Client (typed messages):
-- 'F' + uint32 length + JPEG payload  — frame image
-- 'B' + uint32 length + UTF-8 text    — clipboard text
+- 'F' + uint32 length + JPEG payload  - frame image
+- 'B' + uint32 length + UTF-8 text    - clipboard text
 
 Client -> Server (input events):
-- 'M' + int32 x + int32 y             — mouse move
-- 'P' + uint8 button                  — mouse down (1 left, 2 right, 3 middle)
-- 'R' + uint8 button                  — mouse up
-- 'C' + uint8 button                  — click
-- 'W' + int32 vertical + int32 horiz  — wheel scroll (vertical, horizontal)
-- 'K' + uint8 len + bytes(name)       — key or hotkey (e.g. "ctrl+z")
-- 'B' + uint32 length + utf8 text     — set server clipboard text
+- 'M' + int32 x + int32 y             - mouse move
+- 'P' + uint8 button                  - mouse down (1 left, 2 right, 3 middle)
+- 'R' + uint8 button                  - mouse up
+- 'C' + uint8 button                  - click
+- 'W' + int32 vertical + int32 horiz  - wheel scroll (vertical, horizontal)
+- 'K' + uint8 len + bytes(name)       - key or hotkey (e.g. "ctrl+z")
+- 'B' + uint32 length + utf8 text     - set server clipboard text
 
 Security and warnings
 ---------------------
@@ -109,6 +109,6 @@ Created from the code in this repository. For changes or bug reports, edit the s
 
 License
 -------
-This project is licensed under the MIT License — see the [LICENSE](</C:/Users/mhaddoudi/OneDrive - TRONICO/Documents/__Codes/remote_connect/LICENSE>) file for details.
+This project is licensed under the MIT License - see the [LICENSE](</C:/Users/mhaddoudi/OneDrive - TRONICO/Documents/__Codes/remote_connect/LICENSE>) file for details.
 
 Copyright (c) 2026 MOAD HADDOUDI
