@@ -103,12 +103,8 @@ Extending
 - Add optional compression or adjustable JPEG quality/frame size for lower bandwidth.
 - Implement multiple concurrent clients with per-client input restrictions.
 
-Credits / Notes
-----------------
-Created from the code in this repository. For changes or bug reports, edit the source files and submit updates.
-
 License
 -------
-This project is licensed under the MIT License - see the [LICENSE](</C:/Users/mhaddoudi/OneDrive - TRONICO/Documents/__Codes/remote_connect/LICENSE>) file for details.
+This project is licensed under the MIT License - see the [LICENSE](</C:/Users/mhaddoudi/oneDrive - TRonICO/Documents/__Codes/remote_connect/LICENSE>) file for details.
 
 Copyright (c) 2026 MOAD HADDOUDI
